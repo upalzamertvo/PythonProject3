@@ -45,8 +45,7 @@ BOT_TOKEN = "9251746216:AAFfQo5rIAJi69reSL_ipt8-dldz-8n290w"   # ← токен 
 ADMIN_IDS: Set[int] = {
     6330094840,    # ← админ 1
     8417748949,
-    6968749777,
-    8810626479# ← админ 2
+    8810626479,    # ← админ 2
     # добавляйте сколько нужно
 }
 
@@ -172,6 +171,10 @@ orders: Dict[int, Order] = {}
 next_order_id: int = 1
 
 admin_pending_qr: Dict[int, int] = {}
+
+# Admin → User чат
+admin_pending_chat: Dict[int, int] = {}      # admin_id -> user_id (ожидание первого сообщения)
+active_admin_chats: Dict[int, int] = {}      # user_id -> admin_id (активный диалог)
 
 support_msg_map: OrderedDict[int, int] = OrderedDict()
 SUPPORT_MAP_MAX = 200
@@ -359,6 +362,11 @@ def support_mode_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["⬅️ Выйти из поддержки"]], resize_keyboard=True)
 
 
+def user_chat_kb() -> ReplyKeyboardMarkup:
+    """Клавиатура клиента в чате с админом."""
+    return ReplyKeyboardMarkup([["⬅️ В меню"]], resize_keyboard=True)
+
+
 def stars_kb() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     items = list(STAR_PRICES.items())
@@ -396,6 +404,7 @@ def user_waiting_kb() -> InlineKeyboardMarkup:
 def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Отправить QR", callback_data=f"qr:{order_id}")],
+        [InlineKeyboardButton("💬 Написать пользователю", callback_data=f"chat:{order_id}")],
         [InlineKeyboardButton("✅ Оплата получена", callback_data=f"paid:{order_id}")],
         [InlineKeyboardButton("🏁 Завершить", callback_data=f"done:{order_id}"),
          InlineKeyboardButton("❌ Отменить", callback_data=f"cancel:{order_id}")],
@@ -420,6 +429,11 @@ def admin_price_select_kb() -> InlineKeyboardMarkup:
         rows.append(row)
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")])
     return InlineKeyboardMarkup(rows)
+
+
+def admin_chat_kb() -> ReplyKeyboardMarkup:
+    """Клавиатура админа в режиме чата с пользователем."""
+    return ReplyKeyboardMarkup([["🔚 Завершить диалог"]], resize_keyboard=True)
 
 
 # ──────────────────────────────────────────────
@@ -457,7 +471,8 @@ def qr_caption(order: Order) -> str:
         f"⭐ {order.stars} звёзд\n"
         f"💰 <b>{order.amount_rub:g}{CURRENCY}</b>\n"
         f"💡 Цена при оплате может быть ниже\n\n"
-        f"Отсканируйте QR и оплатите.\n"
+        f"📱 <b>Отсканируйте QR-код в мобильном приложении вашего банка.</b>\n"
+        f"Откройте приложение банка на телефоне → найдите функцию сканирования QR → наведите на код.\n\n"
         f"После оплаты нажмите кнопку ниже 👇"
     )
 
@@ -482,7 +497,8 @@ def admin_panel_text() -> str:
         "💰 <b>Цены</b> — изменить цену на звёзды\n"
         "📊 <b>Статистика</b> — заказы, аптайм, ошибки\n"
         "📋 <b>Заказы</b> — список активных заказов\n\n"
-        "Заказы от клиентов приходят сюда автоматически."
+        "Заказы от клиентов приходят сюда автоматически.\n"
+        "💬 Кнопка «Написать пользователю» — открыть чат с клиентом."
     )
 
 
@@ -522,6 +538,7 @@ def admin_stats_text() -> str:
         f"💬 Сообщений: {stats['messages_total']}\n"
         f"❌ Ошибок: {stats['errors_total']}\n"
         f"👥 В поддержке: {len(support_mode_users)}\n"
+        f"💬 Активных чатов: {len(active_admin_chats)}\n"
         f"👮 Админов: {len(ADMIN_IDS)}"
     )
 
@@ -544,6 +561,12 @@ def admin_orders_text() -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     support_mode_users.discard(uid)
+    # Если был активный чат — выходим из него
+    if uid in active_admin_chats:
+        active_admin_chats.pop(uid)
+    if uid in ADMIN_IDS:
+        context.user_data.pop("state", None)
+        context.user_data.pop("chat_target", None)
     stats["messages_total"] += 1
     await update.message.reply_text(
         "⭐ <b>Магазин Telegram Stars</b>\n\n"
@@ -559,6 +582,9 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Только для администратора.")
         return
+    # Выходим из режима чата, если был
+    context.user_data.pop("state", None)
+    context.user_data.pop("chat_target", None)
     await update.message.reply_text(admin_panel_text(), parse_mode="HTML", reply_markup=admin_panel_kb())
 
 
@@ -596,25 +622,132 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
+        # ── Админ завершает чат с пользователем ──
+        if uid in ADMIN_IDS and text == "🔚 Завершить диалог":
+            target_user = context.user_data.get("chat_target")
+            if target_user:
+                active_admin_chats.pop(target_user, None)
+                await safe_send(
+                    context.bot, target_user,
+                    "🔚 Диалог с поддержкой завершён.\n"
+                    "Если понадобимся — пишите снова! 👋",
+                    reply_markup=user_menu_kb(),
+                )
+            context.user_data.pop("state", None)
+            context.user_data.pop("chat_target", None)
+            await update.message.reply_text(
+                "🔚 Диалог завершён.\n\n/admin — панель управления",
+            )
+            return
+
+        # ── Админ пишет первое сообщение в чат пользователю ──
+        if uid in ADMIN_IDS and context.user_data.get("state") == "awaiting_chat_message":
+            target_user = context.user_data.get("chat_target")
+            if not target_user:
+                context.user_data.pop("state", None)
+                context.user_data.pop("chat_target", None)
+                await update.message.reply_text("⚠️ Ошибка: пользователь не найден.")
+                return
+            # Убираем пользователя из support_mode, чтобы не было конфликтов
+            support_mode_users.discard(target_user)
+            ok = await safe_send(
+                context.bot, target_user,
+                f"💬 <b>Поддержка:</b>\n\n{esc(text)}",
+                reply_markup=user_chat_kb(),
+            )
+            if ok:
+                active_admin_chats[target_user] = uid
+                context.user_data["state"] = "in_chat_with_user"
+                await update.message.reply_text(
+                    "✅ Сообщение отправлено.\n"
+                    "Продолжайте писать — все сообщения идут пользователю.\n"
+                    "🔚 «Завершить диалог» — закончить чат.",
+                    reply_markup=admin_chat_kb(),
+                )
+            else:
+                context.user_data.pop("state", None)
+                context.user_data.pop("chat_target", None)
+                await update.message.reply_text("⚠️ Пользователь заблокировал бота.")
+            return
+
+        # ── Админ в активном чате — текст идёт пользователю ──
+        if uid in ADMIN_IDS and context.user_data.get("state") == "in_chat_with_user":
+            target_user = context.user_data.get("chat_target")
+            if not target_user:
+                context.user_data.pop("state", None)
+                context.user_data.pop("chat_target", None)
+                await update.message.reply_text("⚠️ Ошибка: пользователь не найден.")
+                return
+            ok = await safe_send(
+                context.bot, target_user,
+                f"💬 <b>Поддержка:</b>\n\n{esc(text)}",
+                reply_markup=user_chat_kb(),
+            )
+            if ok:
+                await update.message.reply_text("✅ Отправлено", reply_markup=admin_chat_kb())
+            else:
+                active_admin_chats.pop(target_user, None)
+                context.user_data.pop("state", None)
+                context.user_data.pop("chat_target", None)
+                await update.message.reply_text("⚠️ Пользователь заблокировал бота. Чат завершён.")
+            return
+
         # ── Админ отвечает reply-ом на сообщение поддержки ──
         if uid in ADMIN_IDS and update.message.reply_to_message:
             replied_id = update.message.reply_to_message.message_id
             if replied_id in support_msg_map:
                 target_user = support_msg_map[replied_id]
-                ok = await safe_send(context.bot, target_user, f"💬 <b>Поддержка:</b>\n\n{esc(text)}")
+                ok = await safe_send(
+                    context.bot, target_user,
+                    f"💬 <b>Поддержка:</b>\n\n{esc(text)}",
+                    reply_markup=user_chat_kb() if target_user in active_admin_chats else None,
+                )
                 if ok:
-                    await update.message.reply_text("✅ Отправлено.")
+                    # Если ещё не в активном чате — переводим в режим чата
+                    if target_user not in active_admin_chats:
+                        active_admin_chats[target_user] = uid
+                        context.user_data["state"] = "in_chat_with_user"
+                        context.user_data["chat_target"] = target_user
+                    await update.message.reply_text(
+                        "✅ Отправлено. Теперь можете писать без reply — сообщения идут пользователю.",
+                        reply_markup=admin_chat_kb(),
+                    )
                 else:
                     await update.message.reply_text("⚠️ Пользователь заблокировал бота.")
                 return
 
-        # ── Админ пишет текст без reply ──
+        # ── Админ пишет текст без reply и без активного чата ──
         if uid in ADMIN_IDS:
             await update.message.reply_text(
-                "💡 Чтобы ответить клиенту — нажмите <b>reply</b> на его сообщение.\n\n"
+                "💡 Чтобы ответить клиенту — нажмите <b>reply</b> на его сообщение "
+                "или откройте чат через «💬 Написать пользователю» на заказе.\n\n"
                 "/admin — панель управления\n/stats — статистика",
                 parse_mode="HTML",
             )
+            return
+
+        # ── Клиент в активном чате с админом ──
+        if uid in active_admin_chats:
+            if text == "⬅️ В меню":
+                admin_id = active_admin_chats.pop(uid)
+                await safe_send(
+                    context.bot, admin_id,
+                    f"ℹ️ Пользователь @{esc(user.username or 'без_username')} (ID: {uid}) вышел из чата.",
+                )
+                await update.message.reply_text(
+                    "Вы вышли из чата с поддержкой.", reply_markup=user_menu_kb()
+                )
+                return
+            admin_id = active_admin_chats[uid]
+            uname = user.username or "без_username"
+            sent = await safe_send(
+                context.bot, admin_id,
+                f"💬 <b>@{esc(uname)}</b> (ID: {uid}):\n\n{esc(text)}\n\n↩️ Reply, чтобы ответить",
+                reply_markup=admin_chat_kb(),
+            )
+            if sent:
+                remember_support_msg(sent.message_id, uid)
+            await update.message.reply_text("✅ Отправлено.", reply_markup=user_chat_kb())
             return
 
         # ── Клиент в режиме поддержки ──
@@ -659,6 +792,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text("⚠️ Ошибка. Попробуйте позже.")
         except Exception:
             pass
+
 
 # ──────────────────────────────────────────────
 #  CALLBACK-ОБРАБОТЧИКИ
@@ -762,6 +896,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await safe_answer(query)
             await safe_edit(query, f"💰 <b>{stars}⭐</b>\nСейчас: {old_price}{CURRENCY}\n\nВведите новую цену:")
 
+        elif data.startswith("chat:"):
+            order_id = int(data.split(":", 1)[1])
+            order = orders.get(order_id)
+            if not order:
+                await safe_answer(query, "Заказ не найден", show_alert=True)
+                return
+            context.user_data["state"] = "awaiting_chat_message"
+            context.user_data["chat_target"] = order.user_id
+            await safe_answer(query)
+            await safe_send(
+                context.bot, user_id,
+                f"💬 <b>Чат с пользователем</b>\n"
+                f"👤 @{esc(order.username)} (ID: {order.user_id})\n"
+                f"⭐ Заказ #{order_id}: {order.stars}⭐ — {order.amount_rub:g}{CURRENCY}\n\n"
+                f"Напишите сообщение — оно будет отправлено пользователю.\n"
+                f"Кнопка «🔚 Завершить диалог» — закончить чат.",
+                reply_markup=admin_chat_kb(),
+            )
+
         elif data.startswith("qr:"):
             order_id = int(data.split(":", 1)[1])
             order = orders.get(order_id)
@@ -822,18 +975,51 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     caption = update.message.caption or ""
 
     try:
-        # ── Админ отвечает фото на сообщение поддержки ──
+        # ── Админ отвечает фото на сообщение поддержки (reply) ──
         if user.id in ADMIN_IDS and update.message.reply_to_message:
             replied_id = update.message.reply_to_message.message_id
             if replied_id in support_msg_map:
                 target_user = support_msg_map[replied_id]
                 cap = f"💬 <b>Поддержка:</b>\n\n{esc(caption)}" if caption else "💬 <b>Поддержка</b>"
-                ok = await safe_send_photo(context.bot, target_user, photo.file_id, cap)
+                ok = await safe_send_photo(context.bot, target_user, photo.file_id, cap,
+                                           reply_markup=user_chat_kb() if target_user in active_admin_chats else None)
                 if ok:
-                    await update.message.reply_text("✅ Фото отправлено.")
+                    if target_user not in active_admin_chats:
+                        active_admin_chats[target_user] = user.id
+                        context.user_data["state"] = "in_chat_with_user"
+                        context.user_data["chat_target"] = target_user
+                    await update.message.reply_text("✅ Фото отправлено.", reply_markup=admin_chat_kb())
                 else:
                     await update.message.reply_text("⚠️ Пользователь заблокировал бота.")
                 return
+
+        # ── Админ в режиме чата шлёт фото пользователю (без reply) ──
+        if user.id in ADMIN_IDS and context.user_data.get("state") in ("awaiting_chat_message", "in_chat_with_user"):
+            target_user = context.user_data.get("chat_target")
+            if target_user:
+                cap = f"💬 <b>Поддержка:</b>\n\n{esc(caption)}" if caption else "💬 <b>Поддержка</b>"
+                ok = await safe_send_photo(context.bot, target_user, photo.file_id, cap, reply_markup=user_chat_kb())
+                if ok:
+                    if context.user_data.get("state") == "awaiting_chat_message":
+                        active_admin_chats[target_user] = user.id
+                        context.user_data["state"] = "in_chat_with_user"
+                    await update.message.reply_text("✅ Фото отправлено.", reply_markup=admin_chat_kb())
+                else:
+                    await update.message.reply_text("⚠️ Пользователь заблокировал бота.")
+                return
+
+        # ── Клиент в активном чате шлёт фото ──
+        if user.id in active_admin_chats:
+            admin_id = active_admin_chats[user.id]
+            uname = user.username or "без_username"
+            cap = f"💬 <b>@{esc(uname)}</b> (ID: {user.id}):\n\n{esc(caption)}\n\n↩️ Reply, чтобы ответить" if caption else f"💬 <b>@{esc(uname)}</b> (ID: {user.id})\n\n↩️ Reply, чтобы ответить"
+            sent = await safe_send_photo(context.bot, admin_id, photo.file_id, cap, reply_markup=admin_chat_kb())
+            if sent:
+                remember_support_msg(sent.message_id, user.id)
+                await update.message.reply_text("✅ Фото отправлено.", reply_markup=user_chat_kb())
+            else:
+                await update.message.reply_text("⚠️ Ошибка. Попробуйте позже.")
+            return
 
         # ── Клиент в режиме поддержки шлёт фото ──
         if user.id in support_mode_users:
@@ -857,7 +1043,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if not order_id:
                 await update.message.reply_text(
                     "💡 Сначала нажмите «📤 Отправить QR» на заказе.\n"
-                    "Или reply на сообщение поддержки, чтобы ответить фото."
+                    "Или reply на сообщение поддержки, чтобы ответить фото.\n"
+                    "Или вы в режиме чата — фото уйдёт пользователю."
                 )
                 return
             order = orders.get(order_id)
